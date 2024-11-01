@@ -1,0 +1,1214 @@
+# Import necessary libraries
+import streamlit as st
+import pandas as pd
+import numpy as np
+from stqdm import stqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.optimize import minimize
+from scipy.stats import qmc
+import cvxpy as cp
+from pypfopt import EfficientFrontier, expected_returns, risk_models
+import time
+
+# -------------------------------
+# 1. Imports and Data Loading
+# -------------------------------
+# Load the investment data
+data = pd.read_csv("Cleaned_df.csv", index_col="Date")
+
+# Load static data
+static_data = pd.read_excel("Data/Static.xlsx")
+
+# Load Emissions Data
+scope1_df = pd.read_excel("Data/TC_Scope1.xlsx")
+scope2_df = pd.read_excel("Data/TC_Scope2.xlsx")
+scope3_df = pd.read_excel("Data/TC_Scope3.xlsx")
+
+# Process Emissions Data
+for df in [scope1_df, scope2_df, scope3_df]:
+    df.columns = df.columns.astype(str)
+    df.replace("#NA", np.nan, inplace=True)
+    df.fillna(0, inplace=True)
+    df['ISIN'] = df['ISIN'].fillna('Unknown')
+
+    # Ensure that all columns except 'ISIN' are numeric
+    numeric_cols = df.columns.drop('ISIN')
+    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
+
+# Identify the years columns
+years = [col for col in scope1_df.columns if col != 'ISIN']
+
+# Initialize assets
+assets = data.columns.tolist()
+
+# -------------------------------
+# 2. Risk Aversion Quiz
+# -------------------------------
+# Risk aversion quiz using a form
+def risk_aversion_quiz():
+    st.header("Risk Aversion Quiz")
+    with st.form(key="quiz_form"):
+        score = 0
+        # Question 1
+        q1 = st.radio(
+            "How would you describe your investment experience?",
+            ("No experience", "Some experience", "Experienced", "Very experienced"),
+            key="q1",
+        )
+        # Question 2
+        q2 = st.radio(
+            "Which statement best describes your attitude towards investment risk?",
+            (
+                "Prefer minimal risk",
+                "Accept some risk",
+                "Comfortable with significant risk",
+                "Seek maximum returns with high risk",
+            ),
+            key="q2",
+        )
+        # Question 3
+        q3 = st.radio(
+            "How long is your investment horizon?",
+            ("Less than 1 year", "1-3 years", "3-5 years", "More than 5 years"),
+            key="q3",
+        )
+        # Question 4
+        q4 = st.radio(
+            "If your investment dropped 20% in value, how would you react?",
+            (
+                "Sell immediately",
+                "Consider selling",
+                "Hold expecting rebound",
+                "Buy more",
+            ),
+            key="q4",
+        )
+        # Question 5
+        q5 = st.radio(
+            "Which portfolio would you prefer?",
+            (
+                "Low return, low risk",
+                "Moderate return, moderate risk",
+                "High return, high risk",
+                "Very high return, very high risk",
+            ),
+            key="q5",
+        )
+
+        submit_quiz = st.form_submit_button("Submit Quiz")
+
+    if submit_quiz:
+        # Scoring
+        score += {
+            "No experience": 1,
+            "Some experience": 2,
+            "Experienced": 3,
+            "Very experienced": 4,
+        }[q1]
+        score += {
+            "Prefer minimal risk": 1,
+            "Accept some risk": 2,
+            "Comfortable with significant risk": 3,
+            "Seek maximum returns with high risk": 4,
+        }[q2]
+        score += {
+            "Less than 1 year": 1,
+            "1-3 years": 2,
+            "3-5 years": 3,
+            "More than 5 years": 4,
+        }[q3]
+        score += {
+            "Sell immediately": 1,
+            "Consider selling": 2,
+            "Hold expecting rebound": 3,
+            "Buy more": 4,
+        }[q4]
+        score += {
+            "Low return, low risk": 1,
+            "Moderate return, moderate risk": 2,
+            "High return, high risk": 3,
+            "Very high return, very high risk": 4,
+        }[q5]
+
+        # Calculate risk aversion
+        risk_aversion = (25 - score) / 10  # Higher score indicates lower risk aversion
+        st.write("Your risk aversion score is:", score)
+        st.write("Estimated risk aversion coefficient:", risk_aversion)
+        st.session_state["risk_aversion"] = risk_aversion
+    else:
+        st.stop()
+
+
+# Initialize risk aversion
+if "risk_aversion" not in st.session_state:
+    risk_aversion_quiz()
+else:
+    risk_aversion = st.session_state["risk_aversion"]
+
+
+# -------------------------------
+# 3. Constraints Selection and Parameters
+# -------------------------------
+# Initialize session state variables
+if "optimization_run" not in st.session_state:
+    st.session_state["optimization_run"] = False
+if "weights" not in st.session_state:
+    st.session_state["weights"] = None
+if "mean_returns" not in st.session_state:
+    st.session_state["mean_returns"] = None
+if "cov_matrix" not in st.session_state:
+    st.session_state["cov_matrix"] = None
+if "previous_params" not in st.session_state:
+    st.session_state["previous_params"] = None
+
+# Constraints
+st.header("Constraints Selection")
+long_only = st.checkbox("Long only", value=True)
+use_sentiment = st.checkbox("Use sentiment data?")
+sectors_filter = st.checkbox("Sectors filter")
+country_filter = st.checkbox("Country filter")
+carbon_footprint = st.checkbox("Carbon footprint")  # Existing checkbox
+min_weight_constraint = st.checkbox("Minimum weight constraint")
+max_weight_constraint = st.checkbox("Maximum weight constraint")
+leverage_limit = st.checkbox("Leverage limit")
+
+# Choose objective function
+st.header("Choose Optimization Objective")
+objectives = [
+    "Maximum Sharpe Ratio Portfolio",
+    "Minimum Global Variance Portfolio",
+    "Maximum Diversification Portflio",
+    "Equally Weighted Risk Contribution Portfolio",
+    "Inverse Volatility Portfolio",
+]
+selected_objective = st.multiselect("Select an objective function", objectives)
+
+# Risk-Free Asset Inclusion
+st.header("Risk-Free Asset Inclusion")
+include_risk_free_asset = st.checkbox(
+    "Include a Risk-Free Asset in the Optimization?", value=True
+)
+
+if include_risk_free_asset:
+    risk_free_rate = st.number_input(
+        "Enter the risk-free rate (e.g., 0.01 for 1%)",
+        value=0.01,
+        min_value=0.0,
+        max_value=1.0,
+    )
+else:
+    risk_free_rate = 0.0
+
+# Additional inputs
+if sectors_filter:
+    sectors = static_data["GICSSectorName"].unique().tolist()
+    selected_sectors = st.multiselect("Select sectors to include", sectors)
+else:
+    selected_sectors = None
+
+if country_filter:
+    countries = static_data["Country"].unique().tolist()
+    selected_countries = st.multiselect("Select countries to include", countries)
+else:
+    selected_countries = None
+
+if min_weight_constraint:
+    min_weight_value = (
+        st.number_input(
+            "Minimum weight (%)", min_value=-100.0, max_value=100.0, value=-100.0
+        )
+        / 100
+    )
+else:
+    min_weight_value = 0.0
+if max_weight_constraint:
+    max_weight_value = (
+        st.number_input(
+            "Maximum weight (%)", min_value=0.0, max_value=100.0, value=100.0
+        )
+        / 100
+    )
+else:
+    max_weight_value = 1.0
+
+if leverage_limit:
+    leverage_limit_value = st.number_input("Leverage limit", min_value=0.0, value=1.0)
+else:
+    leverage_limit_value = 1.0
+
+# Function to get current parameters
+def get_current_params():
+    params = {
+        "long_only": long_only,
+        "use_sentiment": use_sentiment,
+        "sectors_filter": sectors_filter,
+        "selected_sectors": (
+            tuple(sorted(selected_sectors)) if selected_sectors else None
+        ),
+        "country_filter": country_filter,
+        "selected_countries": (
+            tuple(sorted(selected_countries)) if selected_countries else None
+        ),
+        "carbon_footprint": carbon_footprint,
+        "min_weight_constraint": min_weight_constraint,
+        "min_weight_value": min_weight_value,
+        "max_weight_constraint": max_weight_constraint,
+        "max_weight_value": max_weight_value,
+        "leverage_limit": leverage_limit,
+        "leverage_limit_value": leverage_limit_value,
+        "include_risk_free_asset": include_risk_free_asset,
+        "risk_free_rate": risk_free_rate,
+        # Include risk_aversion if it can change
+        "risk_aversion": risk_aversion,
+    }
+    return params
+
+# Get current parameters
+risk_aversion = st.session_state.get("risk_aversion", None)
+current_params = get_current_params()
+previous_params = st.session_state.get("previous_params", None)
+
+# Compare current and previous parameters
+if previous_params is not None and current_params != previous_params:
+    st.session_state["optimization_run"] = False
+
+# Update previous parameters
+st.session_state["previous_params"] = current_params
+
+# Emissions Filters
+if carbon_footprint:
+    st.header("Emissions Criteria")
+
+    # Definitions
+    st.write("""
+    **Definitions of Scopes:**
+
+    - **Scope 1**: Direct emissions from owned or controlled sources.
+    - **Scope 2**: Indirect emissions from the generation of purchased electricity, steam, heating, and cooling consumed by the reporting company.
+    - **Scope 3**: All other indirect emissions that occur in a company's value chain.
+    """)
+
+    scopes = st.multiselect(
+        "Select Scope(s) to include in the emissions calculation:",
+        ["Scope 1", "Scope 2", "Scope 3"],
+        default=["Scope 1", "Scope 2", "Scope 3"]
+    )
+
+    # Emissions threshold
+    emission_threshold = st.number_input(
+        "Enter the maximum total emissions (in tons) per company:",
+        min_value=0.0,
+        value=1e6  # Adjust default value as needed
+    )
+
+    # Update emissions data based on selected scopes
+    selected_emissions_dfs = []
+    if "Scope 1" in scopes:
+        selected_emissions_dfs.append(scope1_df)
+    if "Scope 2" in scopes:
+        selected_emissions_dfs.append(scope2_df)
+    if "Scope 3" in scopes:
+        selected_emissions_dfs.append(scope3_df)
+
+    if selected_emissions_dfs:
+        # Start with the first dataframe
+        emissions_df = selected_emissions_dfs[0][['ISIN'] + years].copy()
+        emissions_df.set_index('ISIN', inplace=True)
+
+        # Merge and sum emissions from other scopes
+        for df in selected_emissions_dfs[1:]:
+            df = df[['ISIN'] + years].copy()
+            df.set_index('ISIN', inplace=True)
+            emissions_df = emissions_df.add(df, fill_value=0)
+
+        emissions_df.reset_index(inplace=True)
+    else:
+        st.warning("No scopes selected. Emissions data will not be considered.")
+        emissions_df = pd.DataFrame(columns=['ISIN'] + years)
+        emissions_df['ISIN'] = scope1_df['ISIN']
+        emissions_df[years] = 0
+
+    # Ensure numeric data types
+    numeric_cols = [col for col in emissions_df.columns if col != 'ISIN']
+    emissions_df[numeric_cols] = emissions_df[numeric_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
+
+    # Calculate total emissions
+    emissions_df['Total Emissions'] = emissions_df[years].sum(axis=1)
+
+    # Filter emissions_df to include only companies below the threshold
+    filtered_emissions_df = emissions_df[emissions_df['Total Emissions'] <= emission_threshold]
+
+    # Output the number of companies
+    st.write(f"Number of companies with emissions below threshold ({emission_threshold}): {len(filtered_emissions_df)}")
+
+    # Output the filtered emissions DataFrame with only ISIN and Total Emissions
+    st.write("Emissions DataFrame (ISIN and Total Emissions) for companies below the threshold:")
+    st.dataframe(filtered_emissions_df[['ISIN', 'Total Emissions']])
+
+    # Filter companies based on emission_threshold
+    eligible_isins = filtered_emissions_df['ISIN']
+
+    # Merge investment data with emissions data
+    investment_data = data.copy()
+    investment_data = investment_data.reset_index().melt(id_vars='Date', var_name='ISIN', value_name='Price')
+
+    # Merge with static data
+    investment_data = investment_data.merge(static_data[['ISIN', 'Company', 'GICSSectorName', 'Country']], on='ISIN', how='left')
+
+    # Filter investment data
+    investment_data_filtered = investment_data[investment_data['ISIN'].isin(eligible_isins)]
+else:
+    # Initialize variables if they are used later in the code
+    scopes = []
+    emission_threshold = None
+
+    # Use the original investment data
+    investment_data = data.copy()
+    investment_data = investment_data.reset_index().melt(id_vars='Date', var_name='ISIN', value_name='Price')
+
+    # Merge with static data
+    investment_data_filtered = investment_data.merge(static_data[['ISIN', 'Company', 'GICSSectorName', 'Country']], on='ISIN', how='left')
+# -------------------------------
+# 4. Data Filtering Based on Sectors, Countries, and Emissions
+# -------------------------------
+
+
+# Apply filtering based on sectors and countries using ISIN numbers
+def filter_stocks(data, sectors=None, countries=None):
+    all_isins = data['ISIN'].unique().tolist()
+
+    if sectors is not None:
+        companies_sector = static_data[static_data["GICSSectorName"].isin(sectors)]
+        sector_isins = companies_sector["ISIN"].tolist()
+        all_isins = list(set(all_isins).intersection(set(sector_isins)))
+        st.write(f"Total number of stocks after sector filtering: {len(all_isins)}")
+
+    if countries is not None:
+        companies_country = static_data[static_data["Country"].isin(countries)]
+        country_isins = companies_country["ISIN"].tolist()
+        all_isins = list(set(all_isins).intersection(set(country_isins)))
+        st.write(f"Total number of stocks after country filtering: {len(all_isins)}")
+
+    data_filtered = data[data['ISIN'].isin(all_isins)]
+    return data_filtered
+
+# Apply filtering
+investment_data_filtered = filter_stocks(
+    investment_data_filtered,
+    sectors=selected_sectors,
+    countries=selected_countries
+)
+
+# Update assets list based on investment_data_filtered
+assets = investment_data_filtered['ISIN'].unique().tolist()
+
+# Pivot back to get price data
+data_filtered = investment_data_filtered.pivot(index='Date', columns='ISIN', values='Price')
+
+# Remove columns with all NaNs
+data_filtered.dropna(axis=1, how='all', inplace=True)
+
+# Handle cases with insufficient assets
+minimum_number_of_assets = 10  # Adjust as needed
+if len(assets) < minimum_number_of_assets:
+    st.error("Not enough assets meet the criteria. Please adjust your selections.")
+    st.stop()
+
+# Output the total number of stocks before filtering
+st.write(f"Total number of stocks before filtering: {data.shape[1]}")
+
+# Remove the duplicate filter_stocks function
+# [This function definition is removed]
+
+# Ensure assets list is updated based on data_filtered
+assets = data_filtered.columns.tolist()
+
+# -------------------------------
+# 5. Optimization Function
+# -------------------------------
+# Define adjust_covariance_matrix outside of the optimization function
+def adjust_covariance_matrix(cov_matrix, delta=1e-5):
+    # Compute eigenvalues and eigenvectors
+    eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+
+    if np.all(eigenvalues <= 0):
+        # Adjust negative eigenvalues
+        adjusted_eigenvalues = np.where(eigenvalues > delta, eigenvalues, delta)
+        # Reconstruct the covariance matrix
+        cov_matrix_adjusted = eigenvectors @ np.diag(adjusted_eigenvalues) @ eigenvectors.T
+        # Ensure the covariance matrix is symmetric
+        cov_matrix_adjusted = (cov_matrix_adjusted + cov_matrix_adjusted.T) / 2
+        # Inform the user about the adjustment
+        st.info("Adjusted covariance matrix to be positive definite by correcting negative eigenvalues.")
+        return cov_matrix_adjusted
+    else:
+        # Inform the user
+        st.info("Covariance matrix is PD.")
+        return cov_matrix
+
+# Use data_filtered instead of data in optimization functions
+def optimize_portfolio_PyPortfolioOpt(
+    data_filtered,
+    long_only,
+    min_weight,
+    max_weight,
+    leverage_limit_value,
+    risk_free_rate,
+    include_risk_free_asset,
+    risk_aversion,
+):
+    # Calculate expected returns and covariance matrix
+    returns = data_filtered.pct_change().dropna()
+
+    # Remove infinite values and assets with zero variance
+    returns.replace([np.inf, -np.inf], np.nan, inplace=True)
+    returns.dropna(axis=1, how="any", inplace=True)
+    returns = returns.loc[:, returns.std() > 0]
+
+    mean_returns = returns.mean() * 12
+    cov_matrix = returns.cov() * 12
+
+    if len(data_filtered) / len(cov_matrix) < 2:
+        st.info(f"Len cov matrix : {len(cov_matrix)}")
+        st.info(f"Number observations : {len(data_filtered)}")
+        st.info(f"Ratio of observations / nb. of assets is below 2, current ratio: {len(data_filtered) / len(cov_matrix)}. We use shrinkage.")
+        cov_matrix = risk_models.CovarianceShrinkage(data_filtered, frequency=12).ledoit_wolf()
+        st.info("Covariance matrix shrinked using Ledoit_Wolf.")
+        # Use Ledoit-Wolf shrinkage to ensure the covariance matrix is positive semidefinite
+        cov_matrix = risk_models.fix_nonpositive_semidefinite(cov_matrix)
+
+    # Adjust covariance matrix to be positive definite
+    cov_matrix_adjusted = adjust_covariance_matrix(cov_matrix.values)
+    cov_matrix_adjusted = pd.DataFrame(cov_matrix_adjusted, index=cov_matrix.index, columns=cov_matrix.columns)
+
+    st.write(f"Installed solvers : {cp.installed_solvers()}")
+
+    if leverage_limit:
+        # Set weight bounds
+        if long_only:
+            weight_bounds = (
+                max(min_weight, 0.0),
+                min(max_weight, leverage_limit_value),
+            )
+        else:
+            weight_bounds = (
+                max(min_weight, -leverage_limit_value),
+                min(max_weight, leverage_limit_value),
+            )
+    else:
+        # Set weight bounds
+        if long_only:
+            weight_bounds = (max(min_weight, 0.0), min(max_weight, 1.0))
+        else:
+            weight_bounds = (
+                max(min_weight, -1),
+                min(max_weight, 1),
+            )
+
+    # Prepare result similar to scipy.optimize result
+    class Result:
+        pass
+
+    result = Result()
+
+    solvers_installed = ["OSQP", "ECOS", "ECOS_BB", "SCS", "CLARABEL", "SCIPY"]
+
+    for solver in solvers_installed:
+        # Objective functions
+        try:
+            st.info(f"Trying solver: {solver}")
+
+            # Initialize Efficient Frontier
+            ef = EfficientFrontier(
+                mean_returns,
+                cov_matrix_adjusted,
+                weight_bounds=weight_bounds,
+                solver=solver,
+            )
+
+            # Add leverage limit constraint
+            if leverage_limit:
+                ef.add_constraint(lambda w: cp.sum(w) <= leverage_limit_value)
+                ef.add_constraint(lambda w: cp.sum(w) >= 1)
+            else:
+                ef.add_constraint(lambda w: cp.sum(w) == 1)
+
+            if include_risk_free_asset:
+                # Tangency Portfolio: Maximize Sharpe Ratio
+                ef.max_sharpe(risk_free_rate=risk_free_rate)
+            else:
+                # Maximize Utility Function
+                ef.max_quadratic_utility(risk_aversion=risk_aversion)
+
+            # Extract weights
+            cleaned_weights = ef.clean_weights()
+            weights = pd.Series(cleaned_weights).reindex(assets)
+
+            result.x = weights.values
+            result.success = True
+            result.status = "Optimization Succeeded"
+            result.fun = ef.portfolio_performance(verbose=False)[1]  # Portfolio volatility
+
+            # Return result, mean returns, and covariance matrix
+            return result, mean_returns, cov_matrix_adjusted
+
+        except Exception as e:
+            st.error(f"Solver {solver} failed: {e}")
+            # Move on to the next solver if the current one fails
+
+    # If all solvers fail
+    result.x = None
+    result.success = False
+    result.status = "All solvers failed."
+    result.fun = None
+
+    # Return failure result after all solvers fail
+    return result, mean_returns, cov_matrix_adjusted
+
+# -------------------------------
+# 6. Efficient Frontier Calculation
+# -------------------------------
+
+
+# 6. Efficient Frontier Calculation Using PyPortfolioOpt
+def calculate_efficient_frontier_pypfopt(
+    mean_returns,
+    cov_matrix,
+    risk_free_rate,
+    include_risk_free_asset,
+    long_only,
+    leverage_limit_value,
+    min_weight_value,
+    max_weight_value,
+):
+    # Set weight bounds
+    if long_only:
+        weight_bounds = (
+            max(min_weight_value, 0.0),
+            min(max_weight_value, leverage_limit_value),
+        )
+    else:
+        weight_bounds = (
+            -1,
+            1,
+        )
+
+    # Initialize Efficient Frontier
+    ef = EfficientFrontier(mean_returns, cov_matrix, weight_bounds=weight_bounds)
+
+    # Add leverage limit constraint
+    ef.add_constraint(lambda w: cp.sum(w) <= leverage_limit_value)
+    ef.add_constraint(lambda w: cp.sum(w) >= 1)
+
+    # Generate Efficient Frontier
+    target_returns = np.linspace(
+        -mean_returns.max(),
+        mean_returns.max(),
+        50,
+    )
+    frontier_volatility = []
+    frontier_returns = []
+    frontier_weights = []
+
+    for ret in stqdm(target_returns, desc="PyPortfolioOpt frontier computation..."):
+        ef_copy = ef.deepcopy()
+        ef_copy.efficient_return(target_return=ret)
+        weights = ef_copy.weights
+        frontier_weights.append(weights)
+        performance = ef_copy.portfolio_performance(risk_free_rate=risk_free_rate)
+        frontier_returns.append(performance[0])
+        frontier_volatility.append(performance[1])
+
+    return frontier_volatility, frontier_returns, frontier_weights
+
+
+def calculate_efficient_frontier_qp(
+    mean_returns,
+    cov_matrix,
+    risk_free_rate,
+    include_risk_free_asset,
+    long_only,
+    leverage_limit_value,
+    min_weight_value,
+    max_weight_value,
+):
+    num_assets = len(mean_returns)
+    cov_matrix = cov_matrix.values
+    mean_returns = mean_returns.values
+
+    # # Regularize the covariance matrix to make it positive semidefinite
+    # epsilon = 1e-7  # Small positive value
+    # cov_matrix_np += epsilon * np.eye(num_assets)
+    # cov_matrix = pd.DataFrame(
+    #     cov_matrix_np, index=cov_matrix.index, columns=cov_matrix.columns
+    # )
+
+    # Define variables
+    w = cp.Variable((num_assets, 1))
+    portfolio_return = mean_returns.T @ w
+    portfolio_variance = cp.quad_form(w, cov_matrix)
+
+    if leverage_limit:
+        # Leverage limit constraint
+        # Constraints
+        constraints = [cp.sum(w) >= 1]
+        constraints += [cp.sum(w) <= leverage_limit_value]
+    else:
+        constraints = [cp.sum(w) == 1]
+
+    # Weight bounds
+    if long_only:
+        constraints += [
+            w >= max(min_weight_value, 0.0),
+            w <= min(max_weight_value, leverage_limit_value),
+        ]
+    else:
+        constraints += [
+            w >= -1,
+            w <= 1,
+        ]
+
+    # Target returns for the efficient frontier
+    target_returns = np.linspace(
+        -mean_returns.max(),
+        mean_returns.max() * 3,
+        50,
+    )
+
+    frontier_volatility = []
+    frontier_returns = []
+    frontier_weights = []
+
+    for target_return in stqdm(target_returns, desc="QP Frontier computation..."):
+        # Objective: Minimize variance
+        objective = cp.Minimize(portfolio_variance)
+
+        # Constraints for target return
+        constraints_with_return = constraints + [portfolio_return == target_return]
+
+        # Problem
+        prob = cp.Problem(objective, constraints_with_return)
+
+        # Solve the problem
+        prob.solve(solver=cp.SCS)
+
+        if prob.status not in ["infeasible", "unbounded"]:
+            vol = np.sqrt(portfolio_variance.value)[0]  # Annualized volatility
+            frontier_volatility.append(vol)
+            frontier_returns.append(target_return)
+            frontier_weights.append(w.value.flatten())
+        else:
+            st.warning(
+                f"Optimization failed for target return {target_return:.2%}. Status: {prob.status}"
+            )
+            continue
+
+    return frontier_volatility, frontier_returns, frontier_weights
+
+
+# Efficient Frontier Calculation
+def calculate_efficient_frontier(
+    mean_returns,
+    cov_matrix,
+    risk_free_rate,
+    include_risk_free_asset,
+    long_only,
+    leverage_limit_value,
+    min_weight_value,
+    max_weight_value,
+):
+    if leverage_limit:
+        target_returns = np.linspace(
+            mean_returns.min(),
+            mean_returns.max() * leverage_limit_value * 12 * 2.5,
+            50,
+        )
+    else:
+        target_returns = np.linspace(
+            -mean_returns.max() * 12 * leverage_limit_value,
+            mean_returns.max() * 12 * leverage_limit_value,
+            50,
+        )
+    frontier_volatility = []
+    frontier_returns = []
+    frontier_weights = []
+
+    num_assets = len(mean_returns)
+
+    for idx, target_return in enumerate(
+        stqdm(target_returns, desc="Computing the frontier... ")
+    ):
+        # Constraints for the optimization
+        constraints = [
+            {"type": "eq", "fun": lambda x: np.sum(x) - 1},  # Sum of weights equals 1
+            {
+                "type": "eq",
+                "fun": lambda x: np.sum(x * mean_returns * 12)
+                - target_return,  # Target return constraint
+            },
+        ]
+
+        # Leverage limit constraint
+        if leverage_limit:
+            constraints = [
+                {
+                    "type": "ineq",
+                    "fun": lambda x: leverage_limit_value
+                    - np.sum(x),  # Sum of weights <= leverage limit
+                },
+                {"type": "ineq", "fun": lambda x: np.sum(x) - 1},  # Sum of weights >= 1
+                {
+                    "type": "eq",
+                    "fun": lambda x: np.sum(x * mean_returns * 12)
+                    - target_return,  # Target return constraint --> portfolio return = target return
+                },
+            ]
+
+        # Bounds
+        if long_only:
+            # Apply minimum and maximum weight constraints
+            bounds = tuple(
+                (max(min_weight_value, 0.0), min(max_weight_value, 1.0))
+                for _ in range(num_assets)
+            )
+        else:
+            # Allow short selling within a limit of 1 per asset
+            bounds = tuple((-1, 1) for _ in range(num_assets))
+
+        # Progress bar
+        progress_bar = st.progress(0)
+        iteration_container = st.empty()
+
+        max_iterations = (
+            10  # Set maximum number of iterations for estimation if taking too long
+        )
+
+        iteration_counter = {"n_iter": 0}
+
+        # Callback function to update progress
+        def callbackF(xk):
+            iteration_counter["n_iter"] += 1
+            progress = iteration_counter["n_iter"] / max_iterations
+            progress_bar.progress(min(progress, 1.0))
+            iteration_container.text(f"Iteration: {iteration_counter['n_iter']}")
+
+        # Optimization
+        with st.spinner("Optimization in progress..."):
+            start_time = time.time()
+            result = minimize(
+                lambda x: np.sqrt(
+                    np.dot(x.T, np.dot(cov_matrix * 12, x))
+                ),  # Minimize volatility
+                num_assets * [1.0 / num_assets],  # Initial guess
+                method="SLSQP",
+                bounds=bounds,
+                constraints=constraints,
+                options={"maxiter": max_iterations},
+                callback=callbackF,
+            )
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+
+        progress_bar.empty()
+        iteration_container.empty()
+
+        if result.success:
+            st.success(f"Optimization completed in {elapsed_time:.2f} seconds")
+            frontier_volatility.append(result.fun)
+            frontier_returns.append(target_return)
+            frontier_weights.append(result.x)
+        elif result.status == 9:
+            st.warning(
+                f"Optimization for target return {target_return:.2%} reached maximum iterations."
+            )
+            frontier_volatility.append(result.fun)
+            frontier_returns.append(target_return)
+            frontier_weights.append(result.x)
+        else:
+            # Handle optimization failure
+            st.warning(f"Optimization failed for target return {target_return:.2%}")
+            pass
+
+    return frontier_volatility, frontier_returns, frontier_weights
+
+
+# -------------------------------
+# 7. Sampling Methods Implementation
+# -------------------------------
+
+# --- Adjusted Dirichlet Sampling ---
+
+
+def generate_biased_random_portfolios(
+    mean_returns,
+    cov_matrix,
+    risk_free_rate,
+    num_portfolios,
+    long_only,
+    leverage_limit_value,
+    min_weight_value,
+    max_weight_value,
+    bias_method="expected_returns",
+    lambda_scale=100,
+):
+    num_assets = len(mean_returns)
+    results = np.zeros((3, num_portfolios))
+    weights_record = np.zeros((num_portfolios, num_assets))
+    accepted_portfolios = 0  # Index for accepted portfolios
+
+    # Compute alpha parameters for Dirichlet distribution
+    if bias_method == "expected_returns":
+        alpha = mean_returns.values.copy()
+        alpha = alpha - alpha.min() + 1e-6  # Shift to make all values positive
+        alpha = alpha / alpha.sum()
+    elif bias_method == "inverse_variance":
+        variances = np.diag(cov_matrix)
+        alpha = 1 / variances
+        alpha = alpha - alpha.min() + 1e-6
+        alpha = alpha / alpha.sum()
+    elif bias_method == "combined":
+        variances = np.diag(cov_matrix)
+        alpha = mean_returns.values / variances
+        alpha = alpha - alpha.min() + 1e-6
+        alpha = alpha / alpha.sum()
+    else:
+        raise ValueError(
+            "Invalid bias_method. Choose 'expected_returns', 'inverse_variance', or 'combined'."
+        )
+
+    # Scale alpha parameters
+    alpha = alpha * lambda_scale
+
+    count = 0
+
+    for i in stqdm(range(num_portfolios), desc="Dirichlet sampling..."):
+
+        # Generate weights using Dirichlet distribution with adjusted alpha
+        weights = np.random.dirichlet(alpha)
+        s = np.random.uniform(1, leverage_limit_value)
+        weights *= s  # Scale weights
+
+        # Apply weight bounds
+        weights = np.clip(weights, -1, 1)
+
+        # # Normalize weights to sum to 1
+        # weights /= np.sum(weights)
+
+        # Check leverage limit
+        if np.sum(weights) > leverage_limit_value or np.sum(weights) < 1:
+            count += 1
+            continue  # Skip this portfolio
+
+        # Apply long-only constraint if necessary
+        if long_only and np.any(weights < 0):
+            count += 1
+            continue  # Skip portfolios with negative weights
+
+        # Calculate portfolio performance
+        portfolio_return = np.sum(mean_returns * weights) * 12  # Annualized return
+        portfolio_volatility = np.sqrt(
+            np.dot(weights.T, np.dot(cov_matrix * 12, weights))
+        )  # Annualized volatility
+        sharpe_ratio = (portfolio_return - risk_free_rate) / portfolio_volatility
+
+        results[0, i] = portfolio_volatility
+        results[1, i] = portfolio_return
+        results[2, i] = sharpe_ratio
+        weights_record[i, :] = weights
+
+        accepted_portfolios += 1
+
+    st.write(f"Skipped portfolios from Dirichet: {count}")
+
+    # Truncate arrays to include only accepted portfolios
+    results = results[:, :accepted_portfolios]
+    weights_record = weights_record[:accepted_portfolios, :]
+
+    return results, weights_record
+
+
+# --- Latin Hypercube Sampling (LHS) ---
+
+
+def generate_lhs_random_portfolios(
+    mean_returns,
+    cov_matrix,
+    risk_free_rate,
+    num_portfolios,
+    long_only,
+    leverage_limit_value,
+    min_weight_value,
+    max_weight_value,
+):
+    num_assets = len(mean_returns)
+    results = np.zeros((3, num_portfolios))
+    weights_record = np.zeros((num_portfolios, num_assets))
+    accepted_portfolios = 0  # Index for accepted portfolios
+
+    # Create a Latin Hypercube Sampler
+    sampler = qmc.LatinHypercube(d=num_assets)
+    sample = sampler.random(n=num_portfolios)
+
+    # Scale samples to the desired weight bounds
+    if long_only:
+        lower_bounds = np.full(num_assets, max(min_weight_value, 0.0))
+        upper_bounds = np.full(num_assets, min(max_weight_value, leverage_limit_value))
+    else:
+        lower_bounds = np.full(num_assets, -1)
+        upper_bounds = np.full(num_assets, 1)
+
+    # Transform samples to the desired range
+    weights_array = qmc.scale(sample, lower_bounds, upper_bounds)
+
+    count = 0
+    for i in stqdm(range(num_portfolios), desc="LHS sampling..."):
+        weights = weights_array[i, :]
+
+        # # Normalize weights to sum to 1
+        # weights /= np.sum(weights)
+
+        # Check leverage limit
+        if np.sum(weights) > leverage_limit_value or np.sum(weights) < 1:
+            count += 1
+            continue  # Skip this portfolio
+
+        # Apply long-only constraint if necessary
+        if long_only and np.any(weights < 0):
+            continue  # Skip portfolios with negative weights
+
+        # Calculate portfolio performance
+        portfolio_return = np.sum(mean_returns * weights)  # Annualized return
+        portfolio_volatility = np.sqrt(
+            np.dot(weights.T, np.dot(cov_matrix, weights))
+        )  # Annualized volatility
+        sharpe_ratio = (portfolio_return - risk_free_rate) / portfolio_volatility
+
+        results[0, i] = portfolio_volatility
+        results[1, i] = portfolio_return
+        results[2, i] = sharpe_ratio
+        weights_record[accepted_portfolios, :] = weights
+
+        accepted_portfolios += 1  # Increment index
+
+    st.write(f"Skipped portfolios from LHS: {count}")
+
+    # Truncate arrays to include only accepted portfolios
+    results = results[:, :accepted_portfolios]
+    weights_record = weights_record[:accepted_portfolios, :]
+
+    return results, weights_record
+
+
+# -------------------------------
+# 8. Plotting Function Incorporating Both Sampling Methods
+# -------------------------------
+
+
+# Efficient Frontier Plotting Function
+def plot_efficient_frontier(
+    mean_returns,
+    cov_matrix,
+    risk_free_rate,
+    include_risk_free_asset,
+    weights_optimal,
+    long_only,
+    leverage_limit_value,
+    min_weight_value,
+    max_weight_value,
+    tangency_weights,
+    num_portfolios=5000,
+):
+    # Calculate the efficient frontier with updated constraints
+    frontier_volatility, frontier_returns, frontier_weights = (
+        calculate_efficient_frontier_qp(
+            mean_returns,
+            cov_matrix,
+            risk_free_rate,
+            include_risk_free_asset,
+            long_only,
+            leverage_limit_value,
+            min_weight_value,
+            max_weight_value,
+        )
+    )
+
+    # Check tangency weights
+    if np.sum(tangency_weights) > leverage_limit_value or np.sum(tangency_weights) < 1:
+        st.write("Tangency portfolio doesn't meet the constraints ")
+    else:
+        st.write("Tangency portfolio fit the constraints")
+
+    if np.min(tangency_weights) < -1 or np.max(tangency_weights) > 1:
+        st.write("Tangency portfolio doesn't fit the individual asset leverage limit")
+    else:
+        st.write("Tangency portfolio fit the individual asset leverage limit")
+
+    # # Generate portfolios using Adjusted Dirichlet Sampling
+    # st.info("Generating portfolios using Adjusted Dirichlet Sampling...")
+    # results_dirichlet, _ = generate_biased_random_portfolios(
+    #     mean_returns,
+    #     cov_matrix,
+    #     risk_free_rate,
+    #     num_portfolios,
+    #     long_only,
+    #     leverage_limit_value,
+    #     min_weight_value,
+    #     max_weight_value,
+    #     bias_method="expected_returns",  # You can change to 'inverse_variance' or 'combined'
+    #     lambda_scale=10,  # Adjust as needed
+    # )
+
+    # Generate portfolios using Latin Hypercube Sampling
+    st.info("Generating portfolios using Latin Hypercube Sampling...")
+    results_lhs, _ = generate_lhs_random_portfolios(
+        mean_returns,
+        cov_matrix,
+        risk_free_rate,
+        num_portfolios,
+        long_only,
+        leverage_limit_value,
+        min_weight_value,
+        max_weight_value,
+    )
+
+    # Plotting
+    plt.figure(figsize=(10, 7))
+
+    # # Plot Adjusted Dirichlet Sampling portfolios
+    # plt.scatter(
+    #     results_dirichlet[0],
+    #     results_dirichlet[1],
+    #     c=results_dirichlet[2],
+    #     cmap="viridis",
+    #     s=2,
+    #     alpha=0.4,
+    #     label="Adjusted Dirichlet Portfolios",
+    # )
+
+    # Plot Latin Hypercube Sampling portfolios
+    plt.scatter(
+        results_lhs[0],
+        results_lhs[1],
+        c=results_lhs[2],
+        cmap="plasma",
+        s=2,
+        alpha=0.4,
+        label="LHS Portfolios",
+    )
+
+    # plt.colorbar(label="Sharpe Ratio")
+    plt.plot(
+        frontier_volatility,
+        frontier_returns,
+        "r--",
+        linewidth=3,
+        label="Efficient Frontier",
+    )
+
+    if include_risk_free_asset:
+
+        # Plot the Capital Market Line and Tangency Portfolio
+        tangency_weights = weights_optimal
+        tangency_return = np.sum(mean_returns * tangency_weights)
+        tangency_volatility = np.sqrt(
+            np.dot(tangency_weights.T, np.dot(cov_matrix, tangency_weights))
+        )
+
+        # Plot the Capital Market Line
+        cml_x = [0, tangency_volatility]
+        cml_y = [risk_free_rate, tangency_return]
+        plt.plot(
+            cml_x, cml_y, color="green", linestyle="--", label="Capital Market Line"
+        )
+
+        # Highlight the tangency portfolio
+        plt.scatter(
+            tangency_volatility,
+            tangency_return,
+            marker="*",
+            color="red",
+            s=500,
+            label="Tangency Portfolio",
+        )
+        # else:
+        #     st.warning("Failed to compute the tangency portfolio.")
+    else:
+        # Highlight the optimal portfolio
+        portfolio_return = np.sum(mean_returns * weights_optimal)
+        portfolio_volatility = np.sqrt(
+            np.dot(weights_optimal.T, np.dot(cov_matrix, weights_optimal))
+        )
+        plt.scatter(
+            portfolio_volatility,
+            portfolio_return,
+            marker="*",
+            color="red",
+            s=500,
+            label="Optimal Portfolio",
+        )
+
+    plt.title("Efficient Frontier with Random Portfolios")
+    plt.xlabel("Annualized Volatility")
+    plt.ylabel("Annualized Expected Returns")
+    plt.legend()
+    st.pyplot(plt)
+
+
+# -------------------------------
+# 9. Main Application Logic
+# -------------------------------
+
+if st.button("Run Optimization"):
+    tangency_result, tangency_mean_returns, tangency_cov_matrix = (
+        optimize_portfolio_PyPortfolioOpt(
+            data_filtered,
+            long_only,
+            min_weight_value,
+            max_weight_value,
+            leverage_limit_value,
+            risk_free_rate,
+            include_risk_free_asset,
+            risk_aversion,
+        )
+    )
+    weights = pd.Series(tangency_result.x, index=assets)
+    st.session_state["optimization_run"] = True
+    st.session_state["weights"] = weights
+    st.session_state["mean_returns"] = tangency_mean_returns
+    st.session_state["cov_matrix"] = tangency_cov_matrix
+
+    # Display optimization results
+    # Your existing code for displaying results...
+
+else:
+    st.write('Click "Run Optimization" to compute the optimized portfolio.')
+
+# Run the efficient frontier
+if st.session_state["optimization_run"]:
+    if st.button("Show Efficient Frontier"):
+        # Retrieve necessary variables from session state
+        weights = st.session_state["weights"]
+        mean_returns = st.session_state["mean_returns"]
+        cov_matrix = st.session_state["cov_matrix"]
+
+        num_assets = len(mean_returns)
+        weights_optimal = weights.values
+
+        plot_efficient_frontier(
+            mean_returns,
+            cov_matrix,
+            risk_free_rate,
+            include_risk_free_asset,
+            weights_optimal,
+            long_only,
+            leverage_limit_value,
+            min_weight_value,
+            max_weight_value,
+            weights_optimal,
+            num_portfolios=50000,
+        )
+    else:
+        st.write('Click "Show Efficient Frontier" to display the graph.')
+else:
+    st.write("Run the optimization first to display the efficient frontier.")
